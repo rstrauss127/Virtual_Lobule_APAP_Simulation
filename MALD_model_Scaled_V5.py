@@ -110,36 +110,6 @@ def mald(t, y, kappa_local, gamma_local, regen_rate_local):
     return [dy0,dy1,dy2,dy3,dy4,dy5,dy6,dy7,dy8,dy9]
 
 
-def mald_with_apap_forcing(
-    t,
-    y,
-    kappa_local,
-    gamma_local,
-    regen_rate_local,
-    concentration_times_s,
-    concentration_values_mol_m3,
-    uptake_rate_s,
-    hepatocyte_volume_m3,
-):
-    """MALD RHS with extracellular COMSOL APAP supplied continuously."""
-    dydt = np.asarray(
-        mald(t, y, kappa_local, gamma_local, regen_rate_local),
-        dtype=float,
-    )
-    extracellular_apap = float(
-        np.interp(
-            t,
-            concentration_times_s,
-            concentration_values_mol_m3,
-        )
-    )
-    dydt[0] += (
-        uptake_rate_s
-        * extracellular_apap
-        * hepatocyte_volume_m3
-    )
-    return dydt
-
 def _eigenvalues_2x2(a, b, c, d):
     """Vectorized eigenvalues of real 2x2 matrices."""
     trace = a + d
@@ -359,99 +329,6 @@ def RunMALD(
             f"{solution.message}"
         )
         
-    return solution
-
-
-def RunMALDHistory(
-    x,
-    output_times_s,
-    concentration_times_s,
-    concentration_values_mol_m3,
-    v1,
-    v2,
-    v3,
-    uptake_rate_s,
-    hepatocyte_volume_m3,
-    max_step_s,
-    *,
-    rtol=MALD_RTOL,
-    atol=MALD_ATOL,
-):
-    """Integrate one node across its complete remaining COMSOL history."""
-    initial_state = np.asarray(x, dtype=float)
-    output_times_s = np.asarray(output_times_s, dtype=float)
-    concentration_times_s = np.asarray(concentration_times_s, dtype=float)
-    concentration_values_mol_m3 = np.asarray(
-        concentration_values_mol_m3,
-        dtype=float,
-    )
-
-    if initial_state.shape != (10,) or np.any(~np.isfinite(initial_state)):
-        raise ValueError("MALD initial state must contain 10 finite values.")
-    if output_times_s.ndim != 1 or len(output_times_s) == 0:
-        raise ValueError("output_times_s must be a non-empty 1D array.")
-    if np.any(~np.isfinite(output_times_s)) or np.any(np.diff(output_times_s) <= 0.0):
-        raise ValueError("output_times_s must be finite and strictly increasing.")
-    if concentration_times_s.ndim != 1 or concentration_values_mol_m3.ndim != 1:
-        raise ValueError("APAP forcing times and values must be 1D arrays.")
-    if len(concentration_times_s) != len(concentration_values_mol_m3):
-        raise ValueError("APAP forcing times and values must have equal length.")
-    if concentration_times_s[0] != 0.0:
-        raise ValueError("APAP forcing history must begin at relative time 0 s.")
-    if np.any(np.diff(concentration_times_s) <= 0.0):
-        raise ValueError("APAP forcing times must be strictly increasing.")
-    if concentration_times_s[-1] < output_times_s[-1]:
-        raise ValueError("APAP forcing history does not cover the MALD output times.")
-    if np.any(~np.isfinite(concentration_values_mol_m3)) or np.any(
-        concentration_values_mol_m3 < 0.0
-    ):
-        raise ValueError("APAP concentrations must be finite and nonnegative.")
-    if any(not np.isfinite(value) or value < 0.0 for value in (v1, v2, v3)):
-        raise ValueError("MALD zonation rates must be finite and nonnegative.")
-    if not np.isfinite(uptake_rate_s) or uptake_rate_s < 0.0:
-        raise ValueError("uptake_rate_s must be finite and nonnegative.")
-    if not np.isfinite(hepatocyte_volume_m3) or hepatocyte_volume_m3 <= 0.0:
-        raise ValueError("hepatocyte_volume_m3 must be finite and positive.")
-    if not np.isfinite(max_step_s) or max_step_s <= 0.0:
-        raise ValueError("max_step_s must be finite and positive.")
-    atol = np.asarray(atol, dtype=float)
-    if (
-        not np.isfinite(rtol)
-        or rtol <= 0.0
-        or atol.ndim > 1
-        or (atol.size not in (1, initial_state.size))
-        or np.any(~np.isfinite(atol))
-        or np.any(atol <= 0.0)
-    ):
-        raise ValueError("MALD solver tolerances must be finite and positive.")
-
-    solution = solve_ivp(
-        lambda t, y: mald_with_apap_forcing(
-            t,
-            y,
-            v1,
-            v2,
-            v3,
-            concentration_times_s,
-            concentration_values_mol_m3,
-            uptake_rate_s,
-            hepatocyte_volume_m3,
-        ),
-        [0.0, float(output_times_s[-1])],
-        initial_state,
-        method="Radau",
-        t_eval=output_times_s,
-        max_step=float(max_step_s),
-        rtol=rtol,
-        atol=atol,
-    )
-
-    if not solution.success:
-        raise RuntimeError(
-            "Full-history Radau MALD integration failed: "
-            f"{solution.message}"
-        )
-
     return solution
 
 # Call function to test model

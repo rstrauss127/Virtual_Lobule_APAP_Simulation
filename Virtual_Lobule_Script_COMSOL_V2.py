@@ -53,7 +53,9 @@ HYDRAULIC_CELL_DIAMETER_M = 25e-6
 HEPATOCYTE_FRACTION_OF_SOLID = 1.0
 
 # Ghosh-compatible implicit cellular APAP uptake coefficient.
-APAP_UPTAKE_RATE_S = 8.33e-5
+# APAP_UPTAKE_RATE_S = 8.33e-5
+# Pinto-compatible implicit cellular APAP uptake coefficient.
+APAP_UPTAKE_RATE_S = 1.0
 
 # Store full spatial results only at this interval stride. The final interval
 # is always stored even when it is not divisible by the stride.
@@ -394,17 +396,6 @@ def run(
             "totalIterations must be greater than firstIteration."
         )
 
-    # Relative MALD times for this invocation. Global iteration n represents
-    # the state after interval n, at relative time (n-firstIteration+1)*dt.
-    relative_output_times_s = (
-        np.arange(1, remaining_intervals + 1, dtype=float)
-        * float(timeIteration)
-    )
-    forcing_times_s = np.arange(
-        remaining_intervals + 1,
-        dtype=float,
-    ) * float(timeIteration)
-
     save_iterations = [
         n
         for n in range(firstIteration, totalIterations)
@@ -436,43 +427,54 @@ def run(
     )
 
     for k in range(expected_rows):
-        node_concentration = np.zeros(
-            remaining_intervals + 1,
+        state = hepatocytes_array[k].copy()
+
+        node_history = np.empty(
+            (remaining_intervals, 10),
             dtype=float,
         )
 
-        # At a resumed run, start the interpolated forcing at the preceding
-        # COMSOL field. A new run begins at zero extracellular APAP at t=0.
-        if firstIteration > 0 and firstIteration - 1 < exported_field_count:
-            node_concentration[0] = exported_concentrations[
-                k,
-                firstIteration - 1,
-            ]
+        for local_index, n in enumerate(
+            range(firstIteration, totalIterations)
+        ):
+            # Use this interval's exported COMSOL field.
+            # The existing continuation check permits zero only after
+            # the exported APAP field has become negligible.
+            if n < exported_field_count:
+                extracellular_apap = float(
+                    exported_concentrations[k, n]
+                )
+            else:
+                extracellular_apap = 0.0
 
-        available_start = firstIteration
-        available_stop = min(totalIterations, exported_field_count)
-        available_count = max(0, available_stop - available_start)
-        if available_count:
-            node_concentration[1 : available_count + 1] = (
-                exported_concentrations[
-                    k,
-                    available_start:available_stop,
-                ]
+            # Add APAP ONCE before solving this interval.
+            added_apap_mol = (
+                APAP_UPTAKE_RATE_S
+                * extracellular_apap
+                * REFERENCE_HEPATOCYTE_VOLUME_M3
+                * float(timeIteration)
+            )
+            state[0] += added_apap_mol
+
+            # Unforced MALD: metabolism proceeds from the updated state.
+            solution = MALD.RunMALD(
+                state,
+                float(timeIteration),
+                hepatocytesZonation_array[k, 0],
+                hepatocytesZonation_array[k, 1],
+                hepatocytesZonation_array[k, 2],
+                rtol=effective_rtol,
+                atol=effective_atol,
             )
 
-        solution = MALD.RunMALDHistory(
-            hepatocytes_array[k],
-            relative_output_times_s,
-            forcing_times_s,
-            node_concentration,
-            hepatocytesZonation_array[k, 0],
-            hepatocytesZonation_array[k, 1],
-            hepatocytesZonation_array[k, 2],
-            APAP_UPTAKE_RATE_S,
-            REFERENCE_HEPATOCYTE_VOLUME_M3,
-            timeIteration,
-        )
-        node_history = solution.y.T
+            solver_nfev += int(solution.nfev)
+            solver_njev += int(solution.njev)
+            solver_nlu += int(solution.nlu)
+
+            # Carry all ten states into the next interval.
+            state = solution.y[:, -1].copy()
+            node_history[local_index] = state
+
         hepatocytes_array[k] = node_history[-1]
 
         # Status must still be evaluated at every biological interval because

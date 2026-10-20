@@ -268,6 +268,8 @@ def run(
     totalIterations,
     timeIteration,
     fileNamePrefixe,
+    mald_rtol=None,
+    mald_atol=None,
 ):
     # Record time for runtime stats
     time0 = time()
@@ -425,6 +427,23 @@ def run(
         f"{remaining_intervals} intervals; saving iterations "
         f"{save_iterations}."
     )
+    effective_rtol = (
+    MALD.MALD_RTOL if mald_rtol is None else float(mald_rtol)
+    )
+
+    effective_atol = np.asarray(
+        MALD.MALD_ATOL if mald_atol is None else mald_atol,
+        dtype=float,
+    )
+
+    print(
+        f"Radau tolerances: rtol={effective_rtol:.3e}; "
+        f"atol={effective_atol.tolist()}"
+    )
+
+    solver_nfev = 0
+    solver_njev = 0
+    solver_nlu = 0
 
     for k in range(expected_rows):
         state = hepatocytes_array[k].copy()

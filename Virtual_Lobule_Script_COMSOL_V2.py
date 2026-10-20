@@ -10,9 +10,13 @@ from __future__ import annotations
 
 from pathlib import Path
 import shutil
+import csv
+import json
+import hashlib
 import numpy as np
 from time import time
 from scipy.spatial import cKDTree
+from scipy import __version__ as SCIPY_VERSION
 
 import MALD_model_Scaled_V5 as MALD
 import Initialize_field_Files_V5 as Init
@@ -60,6 +64,192 @@ APAP_UPTAKE_RATE_S = 1.0
 # Store full spatial results only at this interval stride. The final interval
 # is always stored even when it is not divisible by the stride.
 OUTPUT_EVERY_N_INTERVALS = 6
+
+# Optional sequential Field_Nodes IDs for fixed, same-mesh comparison probes.
+# None selects three distinct low/middle/high initial-GSH parameter examples.
+# These automatic examples are NOT anatomical PV/CV location assignments.
+COMPARISON_PROBE_IDS = None
+
+
+class _ComparisonRecorder:
+    """Compact diagnostics for discrete APAP additions and unforced MALD.
+
+    Stores weighted means, not additional full spatial snapshots. Every
+    invocation gets its own interval-range directory, including restarts.
+    Extrema are sampled at initial/post-addition/end states; no AUC is inferred
+    from those sparse values across the discontinuous APAP additions.
+    """
+
+    state_columns = [
+        "mean_APAP_mol_per_cell", "mean_NAPQI_mol_per_cell",
+        "mean_GSH_mol_per_cell", "healthy_fraction", "damaged_fraction",
+        "lysed_fraction", "mean_regeneration_state", "mean_AST_IU_L",
+        "mean_ALT_IU_L", "mean_clotting_state",
+    ]
+    probe_columns = [
+        "APAP_mol_per_cell", "NAPQI_mol_per_cell", "GSH_mol_per_cell",
+        "H", "Z", "Lys", "Regen", "AST_IU_L", "ALT_IU_L", "Clot",
+    ]
+
+    def __init__(self, output_dir, first, total, dt, coordinates, volumes,
+                 weights, initial_states, zonation, random_values,
+                 source_times, probe_ids, settings):
+        self.first, self.total, self.dt = int(first), int(total), float(dt)
+        self.count = self.total - self.first
+        self.run_id = output_dir.name
+        self.directory = output_dir / "Comparison" / (
+            f"intervals_{self.first:06d}_{self.total - 1:06d}"
+        )
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.weights = weights / float(np.sum(weights))
+        self.volumes = volumes / float(np.sum(volumes))
+        self.total_weight = float(np.sum(weights))
+        self.source_times = source_times
+        self.coordinates = coordinates
+        self.initial_mean = self.weights @ initial_states
+        self.post_mean = np.zeros((self.count, 10))
+        self.end_mean = np.zeros((self.count, 10))
+        self.external_mean = np.zeros(self.count)
+        self.added_mean = np.zeros(self.count)
+        self.initial_hzl = initial_states[:, 3:6].sum(axis=1)
+        self.max_hzl_drift = 0.0
+
+        if probe_ids is None:
+            order = np.argsort(initial_states[:, 2], kind="stable")
+            chosen = {}
+            for label, position in (("low_initial_GSH", 0),
+                                    ("middle_initial_GSH", len(order) // 2),
+                                    ("high_initial_GSH", len(order) - 1)):
+                chosen.setdefault(int(order[position]), label)
+        else:
+            ids = list(probe_ids)
+            if any(isinstance(i, bool) or int(i) != i or
+                   not 1 <= int(i) <= len(weights) for i in ids):
+                raise ValueError("Comparison probe IDs must be integers in 1..node_count")
+            if len(set(ids)) != len(ids):
+                raise ValueError("Comparison probe IDs must be unique")
+            chosen = {int(i) - 1: "fixed_node" for i in ids}
+        self.probes = chosen
+        self.probe_rows = []
+        start_phase = "initial" if self.first == 0 else "restart_start"
+        self.start_phase = start_phase
+        for k in self.probes:
+            self._probe(k, self.first - 1, self.first * self.dt,
+                        start_phase, initial_states[k])
+
+        def digest(array):
+            return hashlib.sha256(
+                memoryview(np.ascontiguousarray(array)).cast("B")
+            ).hexdigest()
+
+        self.settings = dict(settings)
+        self.settings.update({
+            "schema_version": 1, "status": "running", "run_id": self.run_id,
+            "first_iteration": self.first, "total_iterations": self.total,
+            "start_time_s": self.first * self.dt,
+            "end_time_s": self.total * self.dt, "interval_s": self.dt,
+            "node_count": len(weights), "total_tissue_volume_m3": float(sum(volumes)),
+            "equivalent_hepatocytes": self.total_weight,
+            "initial_states_sha256": digest(initial_states),
+            "zonation_sha256": digest(zonation),
+            "random_values_sha256": digest(random_values),
+            "coordinates_sha256": digest(coordinates),
+            "control_volumes_sha256": digest(volumes),
+            "probe_selection": "initial_GSH_examples" if probe_ids is None else "fixed_ids",
+            "probes": [{"node_id": k + 1, "label": label,
+                        "xyz_mm": coordinates[k].tolist()} for k, label in chosen.items()],
+            "time_convention": "APAP addition at interval start; COMSOL sample time recorded separately",
+            "cumulative_input_scope": "this invocation only; restarts exclude earlier additions",
+            "extrema_scope": "recorded initial, post_addition, interval_end states only; not continuous extrema",
+        })
+        self._write_settings()
+
+    def _write_settings(self):
+        (self.directory / "run_settings.json").write_text(
+            json.dumps(self.settings, indent=2, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+
+    def _probe(self, k, interval, t, phase, state):
+        self.probe_rows.append([
+            self.run_id, self.probes[k], k + 1,
+            *self.coordinates[k].tolist(), interval, t, phase, *state.tolist(),
+        ])
+
+    def addition(self, k, j, concentration, added, state):
+        self.post_mean[j] += self.weights[k] * state
+        self.external_mean[j] += self.volumes[k] * concentration
+        self.added_mean[j] += self.weights[k] * added
+        if k in self.probes:
+            n = self.first + j
+            self._probe(k, n, n * self.dt, "post_addition", state)
+
+    def end(self, k, j, state):
+        self.end_mean[j] += self.weights[k] * state
+        self.max_hzl_drift = max(
+            self.max_hzl_drift,
+            abs(float(state[3:6].sum()) - self.initial_hzl[k]),
+        )
+        if k in self.probes:
+            n = self.first + j
+            self._probe(k, n, (n + 1) * self.dt, "interval_end", state)
+
+    def _csv(self, name, columns, rows):
+        with (self.directory / name).open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(columns)
+            writer.writerows(rows)
+
+    def finish(self, nfev, njev, nlu, runtime_s):
+        rows = [[self.run_id, self.first - 1, self.first * self.dt,
+                 self.start_phase, *self.initial_mean.tolist()]]
+        inputs = []
+        cumulative = 0.0
+        for j, n in enumerate(range(self.first, self.total)):
+            rows.extend([
+                [self.run_id, n, n * self.dt, "post_addition", *self.post_mean[j].tolist()],
+                [self.run_id, n, (n + 1) * self.dt, "interval_end", *self.end_mean[j].tolist()],
+            ])
+            added_total = self.added_mean[j] * self.total_weight
+            cumulative += added_total
+            from_export = n < len(self.source_times)
+            inputs.append([
+                self.run_id, n, n * self.dt, (n + 1) * self.dt,
+                float(self.source_times[n]) if from_export else "",
+                "COMSOL_export" if from_export else "zero_continuation",
+                self.external_mean[j], self.added_mean[j], added_total, cumulative,
+            ])
+        self._csv("comparison_timeseries.csv",
+                  ["run_id", "interval", "time_s", "phase", *self.state_columns], rows)
+        self._csv("comparison_inputs.csv", [
+            "run_id", "interval", "interval_start_s", "interval_end_s",
+            "comsol_sample_time_s", "input_source",
+            "mean_extracellular_APAP_mol_m3", "mean_added_APAP_mol_per_cell",
+            "total_added_APAP_mol", "cumulative_added_APAP_mol_this_invocation",
+        ], inputs)
+        self.probe_rows.sort(key=lambda row: (row[2], row[6], row[7]))
+        self._csv("comparison_probes.csv", [
+            "run_id", "probe_label", "node_id", "x_mm", "y_mm", "z_mm",
+            "interval", "time_s", "phase", *self.probe_columns,
+        ], self.probe_rows)
+        sampled = np.vstack((self.initial_mean[None, :], self.post_mean, self.end_mean))
+        metrics = [
+            ["sampled_max_mean_APAP_mol_per_cell", float(sampled[:, 0].max())],
+            ["sampled_max_mean_NAPQI_mol_per_cell", float(sampled[:, 1].max())],
+            ["sampled_min_mean_GSH_mol_per_cell", float(sampled[:, 2].min())],
+            ["sampled_max_damaged_fraction", float(sampled[:, 4].max())],
+            ["sampled_max_lysed_fraction", float(sampled[:, 5].max())],
+            ["total_added_APAP_mol_this_invocation", cumulative],
+            ["max_node_H_Z_Lys_drift_from_start", self.max_hzl_drift],
+        ]
+        metrics.extend(["final_" + column, float(value)]
+                       for column, value in zip(self.state_columns, self.end_mean[-1]))
+        self._csv("comparison_metrics.csv", ["metric", "value"], metrics)
+        self.settings.update({"status": "completed", "solver_nfev": int(nfev),
+                              "solver_njev": int(njev), "solver_nlu": int(nlu),
+                              "runtime_s_before_comparison_write": float(runtime_s)})
+        self._write_settings()
+        print(f"Comparison outputs: {self.directory}")
 
 # COMSOL Transport of Diluted Species exports concentration c [mol/m^3].
 # For a concentration export, APAP amount added to MALD compartment is:
@@ -270,6 +460,7 @@ def run(
     fileNamePrefixe,
     mald_rtol=None,
     mald_atol=None,
+    comparison_probe_ids=None,
 ):
     # Record time for runtime stats
     time0 = time()
@@ -445,6 +636,38 @@ def run(
     solver_njev = 0
     solver_nlu = 0
 
+    # Logging only: the discrete additions, solver calls and state updates below
+    # retain their original numerical behavior.
+    comparison = _ComparisonRecorder(
+        output_dir, firstIteration, totalIterations, timeIteration,
+        field_coordinates, node_control_volumes_m3, hepatocyte_weights,
+        hepatocytes_array, hepatocytesZonation_array, hepatocytesRandom_array,
+        output_times_s,
+        COMPARISON_PROBE_IDS if comparison_probe_ids is None else comparison_probe_ids,
+        {
+            "mald_rtol": float(effective_rtol), "mald_atol": effective_atol.tolist(),
+            "mald_method": "Radau", "mald_max_step": "infinity (RunMALD default)",
+            "apap_update": "A += uptake_rate_s * C * reference_cell_volume_m3 * interval_s",
+            "apap_uptake_rate_s_inv": APAP_UPTAKE_RATE_S,
+            "reference_hepatocyte_volume_m3": REFERENCE_HEPATOCYTE_VOLUME_M3,
+            "normal_porosity": porosity_normal,
+            "hepatocyte_fraction_of_solid": HEPATOCYTE_FRACTION_OF_SOLID,
+            "comsol_first_output_time_s": COMSOL_FIRST_OUTPUT_TIME_S,
+            "comsol_export": str(apap_export.resolve()),
+            "comsol_export_size_bytes": apap_export.stat().st_size,
+            "comsol_export_mtime_ns": apap_export.stat().st_mtime_ns,
+            "comsol_export_field_count": exported_field_count,
+            "field_nodes_path": str(FIELD_NODES_PATH.resolve()),
+            "continue_with_zero_after_export": CONTINUE_WITH_ZERO_AFTER_EXPORT,
+            "final_field_relative_tolerance": FINAL_FIELD_RELATIVE_TOLERANCE,
+            "spatial_output_stride": OUTPUT_EVERY_N_INTERVALS,
+            "driver_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            "mald_source_sha256": hashlib.sha256(Path(MALD.__file__).read_bytes()).hexdigest(),
+            "numpy_version": np.__version__,
+            "scipy_version": SCIPY_VERSION,
+        },
+    )
+
     for k in range(expected_rows):
         state = hepatocytes_array[k].copy()
 
@@ -474,6 +697,9 @@ def run(
                 * float(timeIteration)
             )
             state[0] += added_apap_mol
+            comparison.addition(
+                k, local_index, extracellular_apap, added_apap_mol, state
+            )
 
             # Unforced MALD: metabolism proceeds from the updated state.
             solution = MALD.RunMALD(
@@ -493,6 +719,7 @@ def run(
             # Carry all ten states into the next interval.
             state = solution.y[:, -1].copy()
             node_history[local_index] = state
+            comparison.end(k, local_index, state)
 
         hepatocytes_array[k] = node_history[-1]
 
@@ -573,6 +800,7 @@ def run(
         fmt="%.1f",
     )
 
+    comparison.finish(solver_nfev, solver_njev, solver_nlu, time() - time0)
     time1 = time()
     print(f"Total simulation time (s) = {time1 - time0} for simulation: {fileNamePrefixe}")
     return

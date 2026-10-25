@@ -1,4 +1,5 @@
 Results_forced/
+Results_Static/
 comsol_migration_interpolation_setup_markdown_files/
 __pycache__/
 RunLobuleIteration_COMSOL_Method_Template.java
@@ -7,3 +8,4 @@ COMSOL_Porosity_Summary.csv
 SimulationSetUp_COMSOL_V2_PBPK STATIC_copy.py
 Read_Results_Pinto_OG.py
 hepatocytes_status_Hepatocytes.txt
+COMSOL_Files/

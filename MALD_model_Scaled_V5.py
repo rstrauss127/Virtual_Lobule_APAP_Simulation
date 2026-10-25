@@ -1,4 +1,5 @@
-## MALD model from 
+## testing file as of 10/25/2026 
+# MALD model from 
 ##
 
 
@@ -289,6 +290,7 @@ def RunMALD(
     rtol=MALD_RTOL,
     atol=MALD_ATOL,
     max_step=np.inf,
+    dense_output=True,
 ):
     initial_state = np.asarray(x, dtype=float)
     if initial_state.shape != (10,) or np.any(~np.isfinite(initial_state)):
@@ -320,6 +322,7 @@ def RunMALD(
         rtol=rtol,
         atol=atol,
         max_step=max_step,
+        dense_output=dense_output,
     )
 
     # Check if the solver was successful
